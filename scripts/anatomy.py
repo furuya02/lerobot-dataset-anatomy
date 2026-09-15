@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LeRobot Dataset (codebase_version v2.1) を解剖して中身を表示する。
+"""LeRobot Dataset を解剖して中身を表示する（v3.0 / v2.1 両対応）。
 
 使い方:
     python scripts/anatomy.py meta   <dataset_root>
@@ -9,19 +9,20 @@
     python scripts/anatomy.py all    <dataset_root>
 
 dataset_root は meta/ data/ videos/ を直下に持つディレクトリ。
-例: ~/.cache/huggingface/lerobot/local/duck_pickplace_real_20260814
+例: ~/.cache/huggingface/lerobot/<repo_id>
+
+v3.0 と v2.1 の最大の違いは「1 エピソードが 1 ファイルかどうか」。
+v2.1 はファイル名でエピソードを特定できるが、v3.0 は複数エピソードを 1 ファイルに連結し、
+どこからどこまでが何番のエピソードかを meta/episodes/ に持つ。
 """
 
 import argparse
 import json
-import statistics
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
-
-# --- 読み込みユーティリティ ------------------------------------------------
 
 def load_json(path):
     return json.loads(Path(path).read_text())
@@ -32,131 +33,240 @@ def load_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def load_info(root):
-    return load_json(root / "meta" / "info.json")
-
-
-def parquet_path(root, info, episode):
-    """info.json の data_path をそのまま使って parquet の場所を決める。"""
-    chunk = episode // info["chunks_size"]
-    rel = info["data_path"].format(episode_chunk=chunk, episode_index=episode)
-    return root / rel
-
-
-def video_path(root, info, video_key, episode):
-    chunk = episode // info["chunks_size"]
-    rel = info["video_path"].format(
-        episode_chunk=chunk, video_key=video_key, episode_index=episode
-    )
-    return root / rel
-
-
-def video_keys(info):
-    return [k for k, v in info["features"].items() if v["dtype"] == "video"]
-
-
 def head(title):
     print(f"\n=== {title} " + "=" * max(0, 68 - len(title)))
 
 
-# --- meta ------------------------------------------------------------------
+class DatasetFiles:
+    """meta/ data/ videos/ を直接読む最小の読み取り層。
 
-def cmd_meta(root, args):
-    info = load_info(root)
+    lerobot の API は使わない。v2.1 と v3.0 のレイアウトの違いはここで吸収する。
+    """
+
+    def __init__(self, root):
+        self.root = Path(root).expanduser()
+        self.info = load_json(self.root / "meta" / "info.json")
+        self.version = self.info["codebase_version"]
+        if self.version not in ("v3.0", "v2.1"):
+            raise SystemExit(f"未対応の codebase_version: {self.version}")
+
+    # --- 共通 ---------------------------------------------------------------
+
+    @property
+    def fps(self):
+        return self.info["fps"]
+
+    def video_keys(self):
+        return [k for k, v in self.info["features"].items() if v["dtype"] == "video"]
+
+    def files(self):
+        """(ディレクトリ, ファイル数, バイト数) の一覧。"""
+        out = []
+        for d in ("meta", "data", "videos"):
+            fs = [p for p in (self.root / d).rglob("*") if p.is_file()]
+            out.append((d, len(fs), sum(p.stat().st_size for p in fs)))
+        return out
+
+    # --- エピソード一覧 -----------------------------------------------------
+
+    def episodes(self):
+        """[{episode_index, length, tasks, ...}] を episode_index 順で返す。"""
+        if self.version == "v2.1":
+            return load_jsonl(self.root / "meta" / "episodes.jsonl")
+        rows = []
+        for p in sorted((self.root / "meta" / "episodes").rglob("*.parquet")):
+            rows += pq.read_table(p).to_pandas().to_dict("records")
+        return sorted(rows, key=lambda r: r["episode_index"])
+
+    def episode(self, ep):
+        for r in self.episodes():
+            if r["episode_index"] == ep:
+                return r
+        raise SystemExit(f"episode {ep} が meta に見つからない")
+
+    # --- 言語指示 -----------------------------------------------------------
+
+    def tasks(self):
+        """{task_index: task 文字列}"""
+        if self.version == "v2.1":
+            return {r["task_index"]: r["task"] for r in load_jsonl(self.root / "meta" / "tasks.jsonl")}
+        df = pq.read_table(self.root / "meta" / "tasks.parquet").to_pandas().reset_index()
+        return {int(r["task_index"]): r["task"] for _, r in df.iterrows()}
+
+    # --- parquet ------------------------------------------------------------
+
+    def data_files(self):
+        if self.version == "v2.1":
+            return [self._v21_parquet(e["episode_index"]) for e in self.episodes()]
+        seen, out = set(), []
+        for e in self.episodes():
+            key = (e["data/chunk_index"], e["data/file_index"])
+            if key not in seen:
+                seen.add(key)
+                out.append(self.root / self.info["data_path"].format(
+                    chunk_index=key[0], file_index=key[1]))
+        return out
+
+    def _v21_parquet(self, ep):
+        chunk = ep // self.info["chunks_size"]
+        return self.root / self.info["data_path"].format(episode_chunk=chunk, episode_index=ep)
+
+    def parquet_of(self, ep):
+        """エピソード ep の行が入っている parquet のパス。"""
+        if self.version == "v2.1":
+            return self._v21_parquet(ep)
+        e = self.episode(ep)
+        return self.root / self.info["data_path"].format(
+            chunk_index=e["data/chunk_index"], file_index=e["data/file_index"])
+
+    def frames(self, ep):
+        """エピソード ep の行だけを DataFrame で返す。
+
+        v2.1 はファイルがエピソード単位なので全行。
+        v3.0 は 1 ファイルに複数エピソードが入っているので episode_index で絞る。
+        """
+        df = pq.read_table(self.parquet_of(ep)).to_pandas()
+        if self.version == "v3.0":
+            df = df[df["episode_index"] == ep].reset_index(drop=True)
+        return df
+
+    # --- 動画 ---------------------------------------------------------------
+
+    def video_of(self, key, ep):
+        """(パス, from_timestamp, to_timestamp) を返す。v2.1 は区間が無いので None。"""
+        if self.version == "v2.1":
+            chunk = ep // self.info["chunks_size"]
+            p = self.root / self.info["video_path"].format(
+                episode_chunk=chunk, video_key=key, episode_index=ep)
+            return p, None, None
+        e = self.episode(ep)
+        p = self.root / self.info["video_path"].format(
+            video_key=key,
+            chunk_index=e[f"videos/{key}/chunk_index"],
+            file_index=e[f"videos/{key}/file_index"])
+        return p, e[f"videos/{key}/from_timestamp"], e[f"videos/{key}/to_timestamp"]
+
+
+# --- meta -------------------------------------------------------------------
+
+def cmd_meta(ds, args):
+    info = ds.info
 
     head("meta/info.json")
-    for k in ("codebase_version", "robot_type", "fps", "total_episodes",
-              "total_frames", "total_tasks", "total_videos", "total_chunks",
-              "chunks_size"):
-        print(f"{k:20s} {info.get(k)}")
-    print(f"{'data_path':20s} {info.get('data_path')}")
-    print(f"{'video_path':20s} {info.get('video_path')}")
-    print(f"{'splits':20s} {info.get('splits')}")
+    keys = ["codebase_version", "robot_type", "fps", "total_episodes", "total_frames",
+            "total_tasks", "total_videos", "total_chunks", "chunks_size",
+            "data_files_size_in_mb", "video_files_size_in_mb"]
+    for k in keys:
+        if k in info:
+            print(f"{k:24s} {info[k]}")
+    print(f"{'data_path':24s} {info['data_path']}")
+    print(f"{'video_path':24s} {info['video_path']}")
 
-    head("features（info.json が宣言している列と、その実体の置き場所）")
+    head("features（宣言された特徴量と、実体の置き場所）")
     print(f"{'name':32s} {'dtype':8s} {'shape':16s} where")
     for name, f in info["features"].items():
         where = "videos/*.mp4" if f["dtype"] == "video" else "data/*.parquet"
         print(f"{name:32s} {f['dtype']:8s} {str(f['shape']):16s} {where}")
 
-    head("画像特徴量の video 情報（info.json 側の申告値）")
-    for k in video_keys(info):
-        vi = info["features"][k].get("info", {})
-        print(f"{k}")
-        for kk in sorted(vi):
-            print(f"    {kk:24s} {vi[kk]}")
+    head("画像特徴量の申告値")
+    for key in ds.video_keys():
+        print(key)
+        for k, v in sorted(ds.info["features"][key].get("info", {}).items()):
+            print(f"    {k:24s} {v}")
 
-    head("meta/tasks.jsonl（言語指示の実体）")
-    for t in load_jsonl(root / "meta" / "tasks.jsonl"):
-        print(f"  task_index={t['task_index']}  {t['task']!r}")
+    head("言語指示")
+    for i, t in sorted(ds.tasks().items()):
+        print(f"  task_index={i}  {t!r}")
 
-    head("meta/episodes.jsonl（エピソード一覧）")
-    eps = load_jsonl(root / "meta" / "episodes.jsonl")
-    lengths = [e["length"] for e in eps]
-    fps = info["fps"]
+    eps = ds.episodes()
+    lengths = sorted(e["length"] for e in eps)
+    total = sum(lengths)
+    head("エピソード")
     print(f"エピソード数       {len(eps)}")
-    print(f"総フレーム数       {sum(lengths)}  (info.json: {info['total_frames']})")
-    med, avg = statistics.median(lengths), statistics.mean(lengths)
-    print(f"長さ min/median/mean/max {min(lengths)} / {med:g} / {avg:.1f} / {max(lengths)} フレーム")
-    print(f"                         {min(lengths)/fps:.1f} / {med/fps:.1f} / {avg/fps:.1f} / {max(lengths)/fps:.1f} 秒 (fps={fps})")
-    print(f"総時間             {sum(lengths)/fps/60:.1f} 分")
-    print("先頭3件:")
-    for e in eps[:3]:
-        print(f"  {e}")
+    print(f"総フレーム数       {total}  (info.json: {ds.info['total_frames']})")
+    print(f"長さ min/median/mean/max "
+          f"{lengths[0]} / {np.median(lengths):.0f} / {np.mean(lengths):.1f} / {lengths[-1]} フレーム")
+    print(f"{'':25s}{lengths[0]/ds.fps:.1f} / {np.median(lengths)/ds.fps:.1f} / "
+          f"{np.mean(lengths)/ds.fps:.1f} / {lengths[-1]/ds.fps:.1f} 秒 (fps={ds.fps})")
+    print(f"総時間             {total/ds.fps/60:.1f} 分")
 
-    head("meta/episodes_stats.jsonl（正規化用の統計）")
-    stats = load_jsonl(root / "meta" / "episodes_stats.jsonl")
-    print(f"行数 {len(stats)}（エピソードごとに1行）")
-    st0 = stats[0]["stats"]
-    print(f"統計を持っている特徴量: {len(st0)} 個")
-    for name in st0:
-        print(f"  - {name}  keys={sorted(st0[name])}")
-    print("\nepisode 0 の action の統計:")
-    for k, v in st0["action"].items():
-        v = np.array(v).ravel()
-        print(f"  {k:6s} {np.round(v, 3).tolist()}")
-    img = next((k for k in st0 if k.startswith("observation.images")), None)
-    if img:
-        print(f"\nepisode 0 の {img} の統計（画像も統計を持っている）:")
-        for k in ("mean", "std"):
-            v = np.array(st0[img][k]).ravel()
-            print(f"  {k:6s} {np.round(v, 4).tolist()}  ← チャンネルごと(RGB)")
+    if ds.version == "v3.0":
+        head("エピソードはファイル名ではなくメタデータで特定する（v3.0）")
+        print(f"{'ep':>4s} {'length':>7s} {'data file':>12s} {'from_index':>11s} {'to_index':>9s}"
+              f" {'video file':>12s} {'from_ts':>9s} {'to_ts':>9s}")
+        vkey = ds.video_keys()[0]
+        for e in eps[:3] + eps[-2:]:
+            print(f"{e['episode_index']:4d} {e['length']:7d} "
+                  f"{'file-%03d' % e['data/file_index']:>12s} "
+                  f"{e['dataset_from_index']:11d} {e['dataset_to_index']:9d} "
+                  f"{'file-%03d' % e[f'videos/{vkey}/file_index']:>12s} "
+                  f"{e[f'videos/{vkey}/from_timestamp']:9.3f} {e[f'videos/{vkey}/to_timestamp']:9.3f}")
+        print("  ※ 先頭3件と末尾2件のみ表示")
+
+    head("統計（正規化に使う値）")
+    if ds.version == "v3.0":
+        st = load_json(ds.root / "meta" / "stats.json")
+        print("meta/stats.json … データセット全体の統計")
+        print(f"  特徴量 {len(st)} 個 / action の統計キー: {sorted(st['action'])}")
+        for k in ("min", "max", "mean", "std"):
+            print(f"  action {k:5s} {np.round(np.array(st['action'][k]).ravel(), 3).tolist()}")
+        img = next((k for k in st if k.startswith("observation.images")), None)
+        if img:
+            print(f"  {img} mean {np.round(np.array(st[img]['mean']).ravel(), 4).tolist()}")
+        e0 = ds.episodes()[0]
+        sk = sorted({k.split("/")[2] for k in e0 if k.startswith("stats/")})
+        print(f"\nmeta/episodes/*.parquet … エピソードごとの統計も同居している")
+        print(f"  統計の種類: {sk}")
+    else:
+        st = load_jsonl(ds.root / "meta" / "episodes_stats.jsonl")
+        s0 = st[0]["stats"]
+        print(f"meta/episodes_stats.jsonl … 行数 {len(st)}（エピソードごとに1行）")
+        print(f"  特徴量 {len(s0)} 個 / action の統計キー: {sorted(s0['action'])}")
+        for k in ("min", "max", "mean", "std"):
+            print(f"  action {k:5s} {np.round(np.array(s0['action'][k]).ravel(), 3).tolist()}")
+        img = next((k for k in s0 if k.startswith("observation.images")), None)
+        if img:
+            print(f"  {img} mean {np.round(np.array(s0[img]['mean']).ravel(), 4).tolist()}")
+        print("  ※ v2.1 に meta/stats.json は無い（読み込み時に集約する）")
 
     head("ファイルの実数")
-    for d in ("meta", "data", "videos"):
-        files = sorted(p for p in (root / d).rglob("*") if p.is_file())
-        size = sum(p.stat().st_size for p in files)
-        print(f"{d:8s} {len(files):4d} files  {size/1024/1024:8.1f} MB")
-    all_files = [p for p in root.rglob("*") if p.is_file()]
-    all_dirs = [p for p in root.rglob("*") if p.is_dir()]
-    print(f"{'合計':8s} {len(all_files):4d} files + {len(all_dirs)} dirs  "
-          f"{sum(p.stat().st_size for p in all_files)/1024/1024:.1f} MB")
+    tot_f = tot_b = 0
+    for d, n, b in ds.files():
+        print(f"{d:8s} {n:4d} files  {b/1024/1024:8.1f} MB")
+        tot_f += n
+        tot_b += b
+    print(f"{'合計':8s} {tot_f:4d} files  {tot_b/1024/1024:8.1f} MB")
 
 
-# --- data ------------------------------------------------------------------
+# --- data -------------------------------------------------------------------
 
-def cmd_data(root, args):
-    info = load_info(root)
+def cmd_data(ds, args):
     ep = args.episode
-    path = parquet_path(root, info, ep)
+    path = ds.parquet_of(ep)
 
-    head(f"data: episode {ep} の parquet")
-    print(f"path  {path.relative_to(root)}")
+    head(f"data: episode {ep} が入っている parquet")
+    print(f"path  {path.relative_to(ds.root)}")
     print(f"size  {path.stat().st_size/1024:.1f} KB")
 
     table = pq.read_table(path)
-    print(f"rows  {table.num_rows}   cols {table.num_columns}")
+    print(f"file 全体  {table.num_rows} 行 / {table.num_columns} 列")
 
-    head("列の構成（★画像の列が無いことを確認する）")
-    print(f"{'column':24s} {'arrow type':24s} info.json の dtype")
+    df = ds.frames(ep)
+    if ds.version == "v3.0":
+        e = ds.episode(ep)
+        print(f"うち episode {ep} の行  {len(df)} 行"
+              f"（dataset_from_index {e['dataset_from_index']} 〜 {e['dataset_to_index']}）")
+        print("  ← 1 ファイルに複数エピソードが連結されている")
+
+    head("列の構成（画像の列が無いことを確認する）")
+    print(f"{'column':24s} {'arrow type':36s} info.json の dtype")
     for f in table.schema:
-        declared = info["features"].get(f.name, {}).get("dtype", "-")
-        print(f"{f.name:24s} {str(f.type):24s} {declared}")
+        declared = ds.info["features"].get(f.name, {}).get("dtype", "-")
+        print(f"{f.name:24s} {str(f.type):36s} {declared}")
     img_cols = [f.name for f in table.schema if "image" in f.name]
     print(f"\n画像らしき列: {img_cols if img_cols else 'なし ← 画像は mp4 に別置き'}")
 
-    head("先頭3フレーム")
-    df = table.to_pandas()
+    head(f"episode {ep} の先頭3フレーム")
     for i in range(min(3, len(df))):
         r = df.iloc[i]
         print(f"[frame {i}]")
@@ -168,36 +278,36 @@ def cmd_data(root, args):
     head("timestamp の刻み（fps との整合）")
     ts = np.asarray(df["timestamp"], dtype=float)
     d = np.diff(ts)
-    print(f"fps={info['fps']} → 期待される間隔 {1/info['fps']:.6f} s")
-    print(f"実際の間隔 min={d.min():.6f} max={d.max():.6f} 一意な値={np.unique(np.round(d, 9)).tolist()[:5]}")
+    print(f"fps={ds.fps} → 期待される間隔 {1/ds.fps:.6f} s")
+    print(f"実際の間隔 min={d.min():.6f} max={d.max():.6f}")
+    print(f"一意な値={np.unique(np.round(d, 9)).tolist()[:5]}")
 
     head("全 parquet の合計行数（info.json の total_frames と突き合わせる）")
-    total = 0
-    for i in range(info["total_episodes"]):
-        total += pq.read_metadata(parquet_path(root, info, i)).num_rows
-    print(f"合計 {total} 行  /  info.json total_frames = {info['total_frames']}  "
-          f"→ {'一致' if total == info['total_frames'] else '不一致'}")
+    total = sum(pq.read_metadata(p).num_rows for p in ds.data_files())
+    print(f"parquet {len(ds.data_files())} ファイルの合計 {total} 行  /  "
+          f"info.json total_frames = {ds.info['total_frames']}  "
+          f"→ {'一致' if total == ds.info['total_frames'] else '不一致'}")
 
 
-# --- video -----------------------------------------------------------------
+# --- video ------------------------------------------------------------------
 
-def cmd_video(root, args):
+def cmd_video(ds, args):
     import av
 
-    info = load_info(root)
     ep = args.episode
+    n_rows = len(ds.frames(ep))
 
-    for key in video_keys(info):
-        path = video_path(root, info, key, ep)
+    for key in ds.video_keys():
+        path, t0, t1 = ds.video_of(key, ep)
         head(f"video: {key} / episode {ep}")
-        print(f"path  {path.relative_to(root)}")
-        print(f"size  {path.stat().st_size/1024:.1f} KB")
+        print(f"path  {path.relative_to(ds.root)}")
+        print(f"size  {path.stat().st_size/1024/1024:.1f} MB")
 
         with av.open(str(path)) as c:
             v = c.streams.video[0]
-            declared = info["features"][key].get("info", {})
-            # PyAV の codec_context.name は「選ばれたデコーダ名」（AV1 なら libdav1d）で、
-            # ファイルに書かれているコーデックそのものではない。実体は codec_tag（av01）を見る。
+            declared = ds.info["features"][key].get("info", {})
+            # codec_context.name は「PyAV が選んだデコーダ名」（AV1 なら libdav1d）で、
+            # ファイルに書かれているコーデックそのものではない。実体は codec_tag を見る。
             rows = [
                 ("codec(tag)", v.codec_context.codec_tag, declared.get("video.codec")),
                 ("decoder", v.codec_context.name, "(PyAV が選んだデコーダ)"),
@@ -207,27 +317,35 @@ def cmd_video(root, args):
                 ("fps", float(v.average_rate), declared.get("video.fps")),
                 ("frames", v.frames, None),
                 ("duration(s)", round(float(v.duration * v.time_base), 3) if v.duration else None, None),
-                ("audio streams", len(c.streams.audio), declared.get("video.has_audio")),
+                ("audio streams", len(c.streams.audio), declared.get("has_audio")),
             ]
             print(f"\n{'項目':14s} {'mp4 の実体':16s} info.json の申告")
             for name, actual, dec in rows:
                 print(f"{name:14s} {str(actual):16s} {dec}")
+            n_frames = v.frames
 
-        n_rows = pq.read_metadata(parquet_path(root, info, ep)).num_rows
-        print(f"\nparquet の行数 {n_rows} と mp4 のフレーム数を突き合わせる "
-              f"→ 同じなら 1 行 = 1 フレームで対応がとれている")
+        if t0 is None:
+            print(f"\nこの mp4 は episode {ep} 専用。"
+                  f"\nparquet {n_rows} 行 / mp4 {n_frames} フレーム → "
+                  f"{'一致' if n_rows == n_frames else '不一致'}")
+        else:
+            print(f"\nこの mp4 には複数エピソードが連結されている（v3.0）。")
+            print(f"episode {ep} の区間  {t0:.3f} s 〜 {t1:.3f} s  "
+                  f"= {(t1-t0)*ds.fps:.0f} フレーム相当")
+            print(f"parquet {n_rows} 行 / 区間 {(t1-t0)*ds.fps:.0f} フレーム → "
+                  f"{'一致' if abs((t1-t0)*ds.fps - n_rows) < 1 else '不一致'}")
+            print(f"（mp4 全体は {n_frames} フレーム）")
 
 
-# --- diff（action と observation.state の違い） -----------------------------
+# --- diff -------------------------------------------------------------------
 
-def cmd_diff(root, args):
-    info = load_info(root)
+def cmd_diff(ds, args):
     ep = args.episode
-    df = pq.read_table(parquet_path(root, info, ep)).to_pandas()
+    df = ds.frames(ep)
 
-    a = np.stack(df["action"].to_numpy())            # [T, 6] リーダーが指令した角度
+    a = np.stack(df["action"].to_numpy())             # [T, 6] リーダーが指令した角度
     s = np.stack(df["observation.state"].to_numpy())  # [T, 6] フォロワーが実際に到達した角度
-    names = info["features"]["action"]["names"]
+    names = ds.info["features"]["action"]["names"]
     if isinstance(names, dict):
         names = names.get("motors", list(names))
 
@@ -250,7 +368,7 @@ def cmd_diff(root, args):
     print("\n差が大きい時刻 = 指令どおりに動けていない瞬間。"
           "\ngripper なら「物を掴んで閉じきれない」、他の関節なら「可動域や負荷で追いつけない」。")
 
-    head("追従の遅れ（action を k フレーム前にずらすと state に近づくか）")
+    head("追従の遅れ（action を k フレームずらすと state に近づくか）")
     for k in range(0, 5):
         err = np.abs(a[:len(a)-k] - s[k:]).mean()
         print(f"  {k} フレーム遅らせる → 平均絶対差 {err:.3f}")
@@ -260,11 +378,10 @@ def cmd_diff(root, args):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        t = np.asarray(df["timestamp"], dtype=float)
         fig, axes = plt.subplots(len(names), 1, figsize=(9, 1.7 * len(names)), sharex=True)
         for i, n in enumerate(names):
-            axes[i].plot(t, a[:, i], label="action", lw=1.2)
-            axes[i].plot(t, s[:, i], label="observation.state", lw=1.2, ls="--")
+            axes[i].plot(ts, a[:, i], label="action", lw=1.2)
+            axes[i].plot(ts, s[:, i], label="observation.state", lw=1.2, ls="--")
             axes[i].set_ylabel(n, fontsize=8)
             axes[i].tick_params(labelsize=8)
         axes[0].legend(fontsize=8, ncol=2)
@@ -275,7 +392,7 @@ def cmd_diff(root, args):
         print(f"\n図を書き出しました: {args.plot}")
 
 
-# --- entry -----------------------------------------------------------------
+# --- entry ------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -284,24 +401,20 @@ def main():
     for name in ("meta", "data", "video", "diff", "all"):
         sp = sub.add_parser(name)
         sp.add_argument("root", type=Path)
-        if name != "meta":
-            sp.add_argument("--episode", type=int, default=0)
+        sp.add_argument("--episode", type=int, default=0)
         if name in ("diff", "all"):
             sp.add_argument("--plot", default=None, help="PNG の出力先")
     args = p.parse_args()
 
-    root = args.root.expanduser()
-    info = load_info(root)
-    if info["codebase_version"] != "v2.1":
-        print(f"警告: このスクリプトは v2.1 用です（このデータセットは "
-              f"{info['codebase_version']}）\n")
+    ds = DatasetFiles(args.root)
+    print(f"codebase_version = {ds.version}  ({ds.root})")
 
     cmds = {"meta": cmd_meta, "data": cmd_data, "video": cmd_video, "diff": cmd_diff}
     if args.cmd == "all":
         for name in ("meta", "data", "video", "diff"):
-            cmds[name](root, args)
+            cmds[name](ds, args)
     else:
-        cmds[args.cmd](root, args)
+        cmds[args.cmd](ds, args)
 
 
 if __name__ == "__main__":
