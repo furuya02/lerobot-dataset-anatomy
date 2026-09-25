@@ -3,7 +3,16 @@
 LeRobot Dataset を解剖して、中身に何が入っているかを表示するスクリプトです。
 **`v3.0`（現行）と `v2.1`（旧形式）の両方に対応**しています。
 
-**自分のデータセットに当てて使ってください。** このリポジトリにデータセット本体は含まれていません。
+**自分のデータセットに当てて使ってください。** このリポジトリにデータセット本体は含まれていませんが、
+以下の出力例に使った 2 つのデータセットは Hugging Face Hub で公開しています（CC BY 4.0）。
+
+- v3.0：[furuya02/so101-duck-pickup-v30](https://huggingface.co/datasets/furuya02/so101-duck-pickup-v30) — 30 エピソード、カメラ 1 台、H.264
+- v2.1：[furuya02/so101-duck-pickplace-v21](https://huggingface.co/datasets/furuya02/so101-duck-pickplace-v21) — 50 エピソード、カメラ 2 台、AV1
+
+```bash
+hf download furuya02/so101-duck-pickup-v30 --repo-type dataset --local-dir ./duck_v30
+python scripts/anatomy.py all ./duck_v30 --episode 5
+```
 
 分かること:
 

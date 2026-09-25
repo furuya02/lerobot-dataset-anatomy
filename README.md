@@ -3,7 +3,16 @@
 Scripts that dissect a LeRobot Dataset and print what is actually inside.
 **Supports both `v3.0` (current) and `v2.1` (legacy).**
 
-**Point them at your own dataset.** No dataset is bundled with this repository.
+**Point them at your own dataset.** No dataset is bundled with this repository, but the two
+datasets used for the examples below are published on the Hugging Face Hub (CC BY 4.0):
+
+- v3.0: [furuya02/so101-duck-pickup-v30](https://huggingface.co/datasets/furuya02/so101-duck-pickup-v30) — 30 episodes, 1 camera, H.264
+- v2.1: [furuya02/so101-duck-pickplace-v21](https://huggingface.co/datasets/furuya02/so101-duck-pickplace-v21) — 50 episodes, 2 cameras, AV1
+
+```bash
+hf download furuya02/so101-duck-pickup-v30 --repo-type dataset --local-dir ./duck_v30
+python scripts/anatomy.py all ./duck_v30 --episode 5
+```
 
 What you get:
 
