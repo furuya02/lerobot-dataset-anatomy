@@ -168,7 +168,7 @@ def cmd_meta(ds, args):
         where = "videos/*.mp4" if f["dtype"] == "video" else "data/*.parquet"
         print(f"{name:32s} {f['dtype']:8s} {str(f['shape']):16s} {where}")
 
-    head("画像特徴量の申告値")
+    head("画像特徴量の info.json の値")
     for key in ds.video_keys():
         print(key)
         for k, v in sorted(ds.info["features"][key].get("info", {}).items()):
@@ -319,7 +319,7 @@ def cmd_video(ds, args):
                 ("duration(s)", round(float(v.duration * v.time_base), 3) if v.duration else None, None),
                 ("audio streams", len(c.streams.audio), declared.get("has_audio")),
             ]
-            print(f"\n{'項目':14s} {'mp4 の実体':16s} info.json の申告")
+            print(f"\n{'項目':14s} {'mp4 の実体':16s} info.json の値")
             for name, actual, dec in rows:
                 print(f"{name:14s} {str(actual):16s} {dec}")
             n_frames = v.frames

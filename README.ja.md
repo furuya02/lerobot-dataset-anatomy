@@ -22,7 +22,7 @@ python scripts/anatomy.py all ./duck_v30 --episode 5
   連結されており、その境界はファイル名ではなく `meta/episodes/` にあります
 - `action`（リーダーアームが指令した角度）と `observation.state`（フォロワーが実際に到達した角度）
   の違い、および追従の遅れ
-- 実際の `videos/*.mp4`（コーデック・解像度・フレーム数）が `info.json` の申告と一致するか
+- 実際の `videos/*.mp4`（コーデック・解像度・フレーム数）が `info.json` に書かれている値と一致するか
 
 ## v3.0 と v2.1
 
@@ -134,10 +134,10 @@ frame_index              int64                                int64
 画像らしき列: なし ← 画像は mp4 に別置き
 ```
 
-### `video` — mp4 の実体と `info.json` の申告を突き合わせる
+### `video` — mp4 の実体と `info.json` に書かれている値を突き合わせる
 
 ```
-項目             mp4 の実体          info.json の申告
+項目             mp4 の実体          info.json の値
 codec(tag)     avc1             h264
 decoder        h264             (PyAV が選んだデコーダ)
 pix_fmt        yuv420p          yuv420p
